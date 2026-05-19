@@ -28,6 +28,8 @@ import struct ContainerizationOS.Terminal
 /// `LinuxContainer` is an easy to use type for launching and managing the
 /// full lifecycle of a Linux container ran inside of a virtual machine.
 public final class LinuxContainer: Container, Sendable {
+    public static let maxIDLength = 64
+
     /// The identifier of the container.
     public let id: String
 
@@ -332,6 +334,12 @@ public final class LinuxContainer: Container, Sendable {
         configuration: LinuxContainer.Configuration,
         logger: Logger? = nil
     ) throws {
+        guard id.count <= Self.maxIDLength else {
+            throw ContainerizationError(
+                .invalidArgument,
+                message: "container id length \(id.count) exceeds maximum of \(Self.maxIDLength) characters"
+            )
+        }
         if let writableLayer {
             guard writableLayer.isBlock else {
                 throw ContainerizationError(
@@ -447,8 +455,8 @@ public final class LinuxContainer: Container, Sendable {
         "/run/container/\(id)/rootfs"
     }
 
-    private static func guestSocketStagingPath(_ containerID: String, socketID: String) -> String {
-        "/run/container/\(containerID)/sockets/\(socketID).sock"
+    private static func guestSocketStagingPath(_ socketID: String) -> String {
+        "/run/sockets/\(socketID).sock"
     }
 }
 
@@ -551,8 +559,7 @@ extension LinuxContainer {
             var modifiedRootfs = self.rootfs
             modifiedRootfs.options.removeAll(where: { $0 == "ro" })
 
-            let mib: UInt64 = 1.mib()
-            let vmMemory = (self.memoryInBytes + self.config.memoryOverhead + mib - 1) & ~(mib - 1)
+            let vmMemory = self.memoryInBytes + self.config.memoryOverhead
 
             let vmCpus = self.cpus + self.config.cpuOverhead
 
@@ -583,6 +590,16 @@ extension LinuxContainer {
             do {
                 try await vm.withAgent { agent in
                     try await agent.standardSetup()
+
+                    // Mount the unified virtiofs share at /run/virtiofs
+                    // All virtiofs directories appear as subdirectories here
+                    try await agent.mount(
+                        ContainerizationOCI.Mount(
+                            type: "virtiofs",
+                            source: "virtiofs",
+                            destination: "/run/virtiofs",
+                            options: []
+                        ))
 
                     guard let attachments = vm.mounts[self.id] else {
                         throw ContainerizationError(.notFound, message: "rootfs mount not found")
@@ -669,6 +686,7 @@ extension LinuxContainer {
                 var spec = self.generateRuntimeSpec()
                 // We don't need the rootfs (or writable layer), nor do OCI runtimes want it included.
                 // Also filter out file mount holding directories. We'll mount those separately under /run.
+                // Transform virtiofs mounts to bind mounts from /run/virtiofs/{tag}
                 let containerMounts = createdState.vm.mounts[self.id] ?? []
                 let holdingTags = createdState.fileMountContext.holdingDirectoryTags
                 // Drop rootfs, and writable layer if present.
@@ -676,7 +694,18 @@ extension LinuxContainer {
                 var mounts: [ContainerizationOCI.Mount] =
                     containerMounts.dropFirst(mountsToSkip)
                     .filter { !holdingTags.contains($0.source) }
-                    .map { $0.to }
+                    .map { attached -> ContainerizationOCI.Mount in
+                        if attached.type == "virtiofs" {
+                            // Transform to bind mount from holding directory
+                            return ContainerizationOCI.Mount(
+                                type: "none",
+                                source: "/run/virtiofs/\(attached.source)",
+                                destination: attached.destination,
+                                options: ["bind"] + attached.options
+                            )
+                        }
+                        return attached.to
+                    }
                     + createdState.fileMountContext.ociBindMounts()
 
                 // When useInit is enabled, bind mount vminitd from the VM's filesystem
@@ -698,7 +727,7 @@ extension LinuxContainer {
                     mounts.append(
                         ContainerizationOCI.Mount(
                             type: "bind",
-                            source: Self.guestSocketStagingPath(self.id, socketID: socket.id),
+                            source: Self.guestSocketStagingPath(socket.id),
                             destination: socket.destination.path,
                             options: ["bind"]
                         ))
@@ -1035,7 +1064,7 @@ extension LinuxContainer {
         let port: UInt32
         if socket.direction == .into {
             port = self.hostVsockPorts.wrappingAdd(1, ordering: .relaxed).oldValue
-            socket.destination = URL(filePath: Self.guestSocketStagingPath(self.id, socketID: socket.id))
+            socket.destination = URL(filePath: Self.guestSocketStagingPath(socket.id))
         } else {
             port = self.guestVsockPorts.wrappingAdd(1, ordering: .relaxed).oldValue
             socket.source = rootInGuest.appending(path: socket.source.path)
